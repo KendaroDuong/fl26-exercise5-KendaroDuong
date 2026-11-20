@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -37,8 +36,11 @@ private:
 
     std::string socket_path_;
     AddHandler on_add_;
-    int listen_fd_{-1};  // Set by start() before the thread exists; closed after join.
-    std::atomic<bool> stop_requested_{false};
+    // All three are set by start() before the thread exists and closed by
+    // stop() after it is joined, so neither thread writes them while both run.
+    int listen_fd_{-1};
+    int wake_read_fd_{-1};   // The server thread waits on this with poll().
+    int wake_write_fd_{-1};  // stop() writes one byte here to wake it.
     std::thread thread_;
 };
 

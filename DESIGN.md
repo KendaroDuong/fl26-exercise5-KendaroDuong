@@ -1,69 +1,91 @@
-# M4 Decision Record
+# M5 Design Record
 
-## 1. Threads and ownership
+## 1. M4 Fixes
 
-- **GUI thread:** `MainWindow` and all widgets. Owns the `Workspace`, the current `ProcessingCore`, `state_`, and `generation_`.
-- **Build worker:** `run_corpus_build()`, started by `MainWindow::start_build_job()` with `std::async`. At most one exists. `MainWindow` owns its `std::future<BuildResult>`, and `~MainWindow()` cancels and waits for it. A corpus moves from a worker local to `BuildResult`, through the future, to `poll_build()`, and into `processing_core_`. A stale one is destroyed in `poll_build()`.
-- **IPC thread:** `IpcServer::serve()`, a `std::thread` owned by `IpcServer`, which `MainWindow` owns through a `unique_ptr`. `IpcServer::stop()` joins it.
+None of the M4 tests failed, but there were two places where the code used polling, which is not allowed by M5 constraint 3. In `IpcServer::serve()` and `read_exact()`, the code checked the stop flag every 100 ms. In `main.cpp`, a timer also checked the signal flag every 100 ms.
 
-**Constraint 5: mutable data reachable from more than one thread**
+To fix this, I changed both to use pipes instead of polling. Now, `IpcServer::stop()` writes to a pipe to wake up the server thread. The SIGTERM handler also writes to a pipe, which is monitored by a `QSocketNotifier`. This allows the program to respond without repeatedly checking a flag.
 
-| Data | Written by | Read by | Why it is safe |
-|---|---|---|---|
-| Cancel flag (`build_cancel_`) | GUI | GUI, worker | `std::atomic<bool>`; the `shared_ptr` keeps it alive for both |
-| `IpcServer::stop_requested_` | GUI | GUI, IPC | `std::atomic<bool>` |
-| `listen_fd_` | GUI, before the thread starts and after it is joined | GUI, IPC | Never written while the thread runs |
-| `std::future` shared state | Worker | GUI | Synchronized by the standard library |
+## 2. Threads and Shared Data
 
-The worker has its own copy of the `Workspace`, made on the GUI thread before it starts. `socket_path_` and `on_add_` never change after construction. The IPC thread uses the `MainWindow` pointer only for a queued `QMetaObject::invokeMethod`, and `~MainWindow()` joins that thread first.
+The application uses three threads:
 
-## 2. How a finished build is judged valid
+- **GUI thread:** Handles `MainWindow`, the widgets, `Workspace`, the current `ProcessingCore`, and all `CorpusState` objects.
+- **Build worker:** Runs `BuildWorker::run()` on a single `std::thread`. The thread starts when `MainWindow` is created and is stopped and joined when the window is destroyed.
+- **IPC thread:** Runs `IpcServer::serve()` and is joined when `IpcServer::stop()` is called.
 
-`invalidate_corpus()` and `reset_application()` increment `generation_`. `start_build_job()` saves it in `build_generation_`. When the future is ready, `poll_build()` calls `build_is_current()`, which compares the two. A mismatched result or exception is discarded. The cancel flag only saves time; this comparison is what provides correctness.
-
-## 3. Changes since the checkpoint
-
-- Removed `generation` from `BuildResult`. A failed build returns no result, so `build_generation_` handles both cases.
-- Add or Reset during a build now moves to `NotBuilt` immediately, so Build can be clicked again at once. `rebuild_requested_` starts that build after the cancelled worker is collected, which keeps it to one worker.
-- Added `CoreFactory` and `set_core_factory()` so tests can force a build failure.
-
-## 4. CR-1 impact
-
-**Changed:** `main()` (the `--ipc-socket` option and starting the server), `~MainWindow()` (stops the server first), and `CMakeLists.txt`. **New:** `MainWindow::start_ipc_server()`, `MainWindow::remote_add_document()`, `IpcServer`, `ipc_protocol.hpp`, and `tools/aiws_send.cpp`.
-
-**Unchanged:** `add_document_file()`, `invalidate_corpus()`, `build_corpus()`, `poll_build()`, and `build_is_current()`. A remote add arrives on the GUI thread and calls `add_document_file()`, the same path as Add Document, so the existing corpus-state logic already covers it.
-
-**Message format:**
-
-- Request: 4-byte big-endian unsigned N (1 to 65535), then N bytes: absolute path, UTF-8, no terminator.
-- Reply: 1 status byte (0 accepted, 1 rejected), 4-byte big-endian unsigned M (0 to 4096), then M bytes: UTF-8 reason. M is 0 when accepted.
-
-Length prefixes allow newlines in paths and let `read_exact()` reassemble split data. `aiws_send` resolves relative paths because only it knows its working directory. `IpcServer` checks readability and replies without waiting for the GUI thread.
-
-**Decisions on ambiguous points:** A duplicate path returns true and changes nothing, as in M3. Clients are served one at a time, with a 3 s idle timeout. If the socket cannot be bound, the GUI still runs and prints an error. Usage errors in `aiws_send` exit with 2.
-
-## 5. Fault switches
-
-| Macro | Where | Caught by |
+| Shared Data | Threads | How It Is Protected |
 |---|---|---|
-| `AIWS_FAULT_ACCEPT_STALE` | `build_is_current()` accepts every build; `cancel_running_build()` does not cancel | `add_during_build_discards_stale_result`, `reset_during_build_discards_stale_result`, `build_clicked_right_after_add_reflects_all_documents`, `remote_add_during_build_invalidates_it` |
-| `AIWS_FAULT_LOSE_FAILURE` | `report_build_failure()` returns without reporting, so the state stays `Building` | `failed_build_is_reported_and_app_stays_usable` |
+| `pending_`, `wanted_id_`, `stop_`, `finished_` | GUI and worker | All access is protected by `BuildWorker::mutex_`. |
+| Pipe file descriptors | GUI and worker / IPC | Created before the threads start and closed after they join. Data is passed through the pipes. |
+| Remote-add path | IPC and GUI | The path is copied into a queued `invokeMethod()` call so it can be handled on the GUI thread. |
 
-## 6. AI-use disclosure
+Each `BuildRequest` contains its own copy of the workspace, so the worker does not need to access the GUI's workspace directly. Once the build finishes, the result is moved back to the GUI thread.
 
-I used Claude (Claude Code) throughout M4 to help create an outline for the design notes and provide a starting point for the implementation and tests. I used this outline as a reference, but I developed and wrote my own code based on my understanding of the requirements. The final code is my own implementation, with changes I made to the structure and logic. I also used Claude to help prepare for the pair programming session. I checked my understanding by reviewing the code, making changes where needed, and testing the implementation to make sure it worked as expected.
+The worker only holds the mutex when it needs to access shared data or wait for a request. I also made sure that when a new build is submitted, any completed result from an older build is cleared so it cannot be used.
 
-## Pair programming log
+## 3. States
 
-**Partner:** Zachary LaCava
+The application uses five states to keep track of the corpus and determine what actions are allowed.
 
-| Session | Date | Start–End | Whose code | Part of the code | Role swaps |
+| State | Meaning | Build Requested | Workspace Changed | Reset | Build Finished/Failed |
 |---|---|---|---|---|---|
-| 1 | Nov 4, 2026 | 7:22–7:52 pm | Mine | Background build: poll timer, `poll_build()`, and `add_document_file()` | I drove first; swapped to my partner at 7:37 pm |
-| 2 | Nov 4, 2026 | 8:00–8:30 pm | Partner's | CR-1 sockets: starting and stopping threads in `main.cpp` and `sendResponse()` in `ipc.cpp` | My partner drove first; swapped to me at 8:15 pm |
+| `NotBuiltState` | No corpus has been built, or the application was reset. | Building | Stays NotBuilt | NotBuilt | Ignored |
+| `BuildingState(id)` | A build is currently wanted. | Ignored | Cancel → OutOfDate | Cancel → NotBuilt | Matching ID → Current / Failed; otherwise ignored |
+| `CurrentState` | The corpus matches the workspace and can be used. | Building | OutOfDate | NotBuilt | Ignored |
+| `OutOfDateState` | The workspace has changed since the build. | Building | Stays OutOfDate | NotBuilt | Ignored |
+| `FailedState` | The last build failed. | Building | OutOfDate | NotBuilt | Ignored |
 
-**My contribution as navigator:** I noticed that `add_document_file()` updates the GUI, so it cannot be called directly from the socket thread. I suggested using a queued `invokeMethod` call so it runs on the GUI thread instead.
+Each state handles an event and returns the next state. If nothing needs to change, it returns `nullptr`. `MainWindow::change_state()` then updates the current state and calls `enter()`.
 
-**My partner's contribution as navigator:** While I was working on `poll_build()`, my partner helped catch some typos and suggested adding `catch (...)` to handle any unexpected errors.
+When the application exits, `MainWindow` calls `BuildWorker::stop()` regardless of the current state. This makes sure the worker thread is stopped and joined before the application closes.
 
-**What kind of interaction worked best:** Going over what each function needed to do before writing the code worked best for us. This helped us catch problems early instead of finding them when compiling.
+## 4. Trace: Reset During a Long Build
+
+1. The user presses Reset, which calls `reset_application()`. This calls `BuildingState::reset()`, followed by `MainWindow::cancel_build()` and `BuildWorker::cancel()`. The worker locks the mutex, sets `wanted_id_` to 0, clears `pending_`, and calls `notify_one()`.
+
+2. If the worker is waiting inside `build()` using `wake_.wait_for()`, the notification wakes it up. Since `unwanted(id)` is now true, the worker stops the current build and returns without a result.
+
+3. The worker returns to `run()`. Since there is no completed result to save, it goes back to waiting for another request.
+
+4. The GUI changes to `NotBuiltState` and displays "Corpus: Not built". If the user adds a document and presses Build again, `start_build()` submits a new request and immediately wakes the worker.
+
+This makes sure that resetting during a long build does not force the user to wait for the old build to finish before starting another one.
+
+## 5. Design Decisions
+
+**1. Build requested during another build**
+
+I decided not to allow another build to start while one is already running for the current workspace. `BuildingState::accepts_build_request()` disables the Build Corpus button, and `BuildingState::build_requested()` ignores any additional requests. There is no reason to start another build when one for the same workspace is already in progress.
+
+**2. Remote add during a build**
+
+A remote add is handled the same way as adding a document through the GUI. `remote_add_document()` calls `add_document_file()`, which then calls `BuildingState::workspace_changed()`.
+
+This cancels the current build because the workspace has changed and the old build would no longer match it. The new document is added to the workspace, and the status changes to "Corpus: Out of date (Build Corpus required)". The Build Corpus button is also enabled so the user can start another build.
+
+**3. Shared data between threads**
+
+I kept `pending_`, `finished_`, `wanted_id_`, and `stop_` because each one has a different purpose.
+
+- `pending_` holds the next build request for the worker.
+- `finished_` holds the completed result until the GUI collects it.
+- `wanted_id_` tells the worker whether the current build is still needed.
+- `stop_` tells the worker when the application is shutting down.
+
+These variables allow the GUI and worker to communicate without accessing each other's data directly. Each is needed to handle a different part of the build process.
+
+## 6. Fault Switches
+
+I included two fault switches to make sure the tests can detect problems with cancellation and shutdown.
+
+| Macro | What It Changes | Test That Detects It |
+|---|---|---|
+| `AIWS_FAULT_NO_CANCEL` | Changes `BuildWorker::unwanted()` so it ignores `wanted_id_`, preventing normal cancellation. | `reset_during_long_build_does_not_delay_next_build` and `add_during_long_build_does_not_delay_next_build` |
+| `AIWS_FAULT_SILENT_SHUTDOWN` | Removes `notify_one()` from `BuildWorker::stop()`, so an idle worker may never wake up to exit. | `idle_application_exits_promptly` |
+
+The first fault checks that an old build can be canceled without delaying a new one. The second checks that the worker can shut down properly even when it is waiting for work.
+
+## 7. AI-Use Disclosure
+
+I used Claude to help create an outline for the worker, state classes, tests, and this design record. I used that outline as a starting point and then developed my own code and implementations based on my understanding of the requirements. The final code is my own work. I also reviewed and tested the implementation myself to make sure it worked correctly and that I understood how each part functions.

@@ -12,15 +12,14 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <initializer_list>
 #include <utility>
-#include <vector>
 
 namespace aiws {
 
 namespace {
 
-constexpr int kPollSliceMs = 100;                      // Bounds stop latency (E4).
-constexpr std::chrono::seconds kClientIdleTimeout{3};  // Bounds a silent client.
+constexpr std::chrono::milliseconds kClientIdleTimeout{3000};  // Bounds a silent client.
 
 bool fill_address(const std::string& path, sockaddr_un& address) {
     if (path.size() >= sizeof(address.sun_path)) {
@@ -69,21 +68,21 @@ void send_reply(int fd, unsigned char status, std::string reason) {
     if (reason.size() > ipc::kMaxReasonBytes) {
         reason.resize(ipc::kMaxReasonBytes);
     }
-    std::string reply;
-    reply.push_back(static_cast<char>(status));
-    ipc::append_u32(reply, static_cast<std::uint32_t>(reason.size()));
-    reply += reason;
 
-    // The reply fits in the socket buffer. MSG_NOSIGNAL: a vanished client
-    // must not kill the application with SIGPIPE.
-    std::size_t sent = 0;
-    while (sent < reply.size()) {
-        ssize_t n = ::send(fd, reply.data() + sent, reply.size() - sent,
-                           MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (n <= 0) {
-            return;
+    std::string message(1, static_cast<char>(status));
+    ipc::append_u32(message, static_cast<std::uint32_t>(reason.size()));
+    message += reason;
+
+    // MSG_NOSIGNAL prevents SIGPIPE if the client has disconnected.
+    std::size_t offset = 0;
+    while (offset < message.size()) {
+        const auto count = ::send(fd, message.data() + offset,
+                                  message.size() - offset,
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (count <= 0) {
+            break;
         }
-        sent += static_cast<std::size_t>(n);
+        offset += static_cast<std::size_t>(count);
     }
 }
 
@@ -128,14 +127,33 @@ bool IpcServer::start(std::string& error) {
     }
     ::chmod(socket_path_.c_str(), 0600);
 
+    int wake[2];
+    if (::pipe2(wake, O_CLOEXEC) != 0) {
+        error = std::strerror(errno);
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        ::unlink(socket_path_.c_str());
+        return false;
+    }
+    wake_read_fd_ = wake[0];
+    wake_write_fd_ = wake[1];
+
     thread_ = std::thread(&IpcServer::serve, this);
     return true;
 }
 
 void IpcServer::stop() {
-    stop_requested_.store(true);
     if (thread_.joinable()) {
+        const char byte = 1;
+        ssize_t written = ::write(wake_write_fd_, &byte, 1);  // Wakes poll() at once.
+        (void)written;
         thread_.join();
+    }
+    for (int* fd : {&wake_read_fd_, &wake_write_fd_}) {
+        if (*fd >= 0) {
+            ::close(*fd);
+            *fd = -1;
+        }
     }
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
@@ -144,14 +162,28 @@ void IpcServer::stop() {
     }
 }
 
+// Blocks in poll() until a client connects or stop() writes to the wake pipe.
 void IpcServer::serve() {
-    while (!stop_requested_.load()) {
-        pollfd waiting{listen_fd_, POLLIN, 0};
-        int ready = ::poll(&waiting, 1, kPollSliceMs);
-        if (ready <= 0) {
-            continue;  // Timeout or EINTR: re-check the stop flag.
+    while (true) {
+        pollfd fds[] = {
+            {listen_fd_, POLLIN, 0},
+            {wake_read_fd_, POLLIN, 0}
+        };
+
+        if (::poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
         }
-        int client = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+        if (fds[1].revents != 0) {
+            break;  // stop() woke the thread.
+        }
+        if (!(fds[0].revents & POLLIN)) {
+            continue;
+        }
+
+        const int client = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
         if (client >= 0) {
             handle_client(client);
             ::close(client);
@@ -159,20 +191,29 @@ void IpcServer::serve() {
     }
 }
 
-// Waits only in short slices, so stop() is honored even mid-request.
-// Reassembles data that arrives in pieces (E3).
+// Blocks in poll() on the client and the wake pipe, so stop() is honored even
+// mid-request. Reassembles data that arrives in pieces (E3).
 bool IpcServer::read_exact(int fd, unsigned char* buffer, std::size_t count) {
-    auto last_data = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    auto deadline = Clock::now() + kClientIdleTimeout;
     std::size_t received = 0;
 
     while (received < count) {
-        if (stop_requested_.load() ||
-            std::chrono::steady_clock::now() - last_data > kClientIdleTimeout) {
-            return false;
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now());
+        if (left.count() <= 0) {
+            return false;  // Silent client.
         }
-        pollfd waiting{fd, POLLIN, 0};
-        if (::poll(&waiting, 1, kPollSliceMs) <= 0) {
+        pollfd waiting[2] = {{fd, POLLIN, 0}, {wake_read_fd_, POLLIN, 0}};
+        int ready = ::poll(waiting, 2, static_cast<int>(left.count()));
+        if (ready < 0 && errno == EINTR) {
             continue;
+        }
+        if (ready < 0 || waiting[1].revents != 0) {
+            return false;  // Error, or stop() was called.
+        }
+        if (ready == 0) {
+            continue;  // Deadline reached; the check above ends the wait.
         }
         ssize_t n = ::recv(fd, buffer + received, count - received, 0);
         if (n == 0) {
@@ -185,7 +226,7 @@ bool IpcServer::read_exact(int fd, unsigned char* buffer, std::size_t count) {
             return false;
         }
         received += static_cast<std::size_t>(n);
-        last_data = std::chrono::steady_clock::now();
+        deadline = Clock::now() + kClientIdleTimeout;
     }
     return true;
 }
@@ -196,25 +237,25 @@ void IpcServer::handle_client(int client_fd) {
         return;
     }
 
-    const std::uint32_t length = ipc::read_u32(header);
+    const auto length = ipc::read_u32(header);
     if (length == 0 || length > ipc::kMaxPathBytes) {
         send_reply(client_fd, ipc::kStatusRejected, "invalid path length");
         return;
     }
 
-    std::vector<unsigned char> bytes(length);
-    if (!read_exact(client_fd, bytes.data(), bytes.size())) {
-        return;
-    }
-    const std::string path(bytes.begin(), bytes.end());
-
-    const std::string reason = why_unreadable(path);
-    if (!reason.empty()) {
-        send_reply(client_fd, ipc::kStatusRejected, reason);
+    std::string path(length, '\0');
+    if (!read_exact(client_fd,
+                    reinterpret_cast<unsigned char*>(&path[0]), path.size())) {
         return;
     }
 
-    on_add_(path);  // Queues the add for the GUI thread; does not wait for it.
+    const auto error = why_unreadable(path);
+    if (!error.empty()) {
+        send_reply(client_fd, ipc::kStatusRejected, error);
+        return;
+    }
+
+    on_add_(path);  // GUI work is queued; the reply does not wait for it.
     send_reply(client_fd, ipc::kStatusAccepted, "");
 }
 

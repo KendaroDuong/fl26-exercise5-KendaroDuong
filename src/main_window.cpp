@@ -7,11 +7,10 @@
 #include <QLabel>
 #include <QMetaObject>
 #include <QPushButton>
-#include <QTimer>
+#include <QSocketNotifier>
 #include <QVBoxLayout>
 #include <QWidget>
 
-#include <chrono>
 #include <exception>
 #include <memory>
 #include <string>
@@ -20,7 +19,6 @@
 
 #include "aiws/document.hpp"
 #include "aiws/gui/context_widget.hpp"
-#include "aiws/gui/resettable.hpp"
 #include "aiws/gui/search_widget.hpp"
 #include "aiws/gui/term_inspector_widget.hpp"
 #include "aiws/gui/workspace_widget.hpp"
@@ -100,25 +98,25 @@ MainWindow::MainWindow(QWidget* parent)
     connect(exit_button_, &QPushButton::clicked,
             this, &MainWindow::exit_application);
 
-    poll_timer_ = new QTimer(this);
-    poll_timer_->setInterval(kPollIntervalMs);
-    connect(poll_timer_, &QTimer::timeout,
-            this, &MainWindow::poll_build);
+    // The one build thread (R1), alive until ~MainWindow(). When a wanted
+    // build finishes, the worker makes finished_fd() readable, and the event
+    // loop runs collect_finished_build() here on the GUI thread.
+    worker_ = std::make_unique<BuildWorker>();
+    build_done_notifier_ = std::make_unique<QSocketNotifier>(
+        worker_->finished_fd(), QSocketNotifier::Read);
+    connect(build_done_notifier_.get(), &QSocketNotifier::activated,
+            this, &MainWindow::collect_finished_build);
 
-    update_action_states();
+    change_state(std::make_unique<NotBuiltState>());
 }
 
 MainWindow::~MainWindow() {
     // Stop serving first: nothing may queue new work while the window goes away.
     ipc_server_.reset();
 
-    // A plain store, not cancel_running_build(): shutdown must stay prompt.
-    if (build_cancel_) {
-        build_cancel_->store(true);
-    }
-    if (build_future_.valid()) {
-        build_future_.wait();
-    }
+    // Exit, in any state: wake the worker, let it drop any build, and join it.
+    build_done_notifier_.reset();
+    worker_->stop();
 }
 
 void MainWindow::set_exit_callback(ExitCallback callback) noexcept {
@@ -126,39 +124,29 @@ void MainWindow::set_exit_callback(ExitCallback callback) noexcept {
 }
 
 bool MainWindow::add_document_file(const QString& path) {
-    QFileInfo info(path);
-    std::string id = info.absoluteFilePath().toStdString();
+    const QFileInfo info(path);
+    const std::string id = info.absoluteFilePath().toStdString();
 
-    for (const Document& document : workspace_.documents()) {
+    for (const auto& document : workspace_.documents()) {
         if (document.id() == id) {
-            status_label_->setText(
-                tr("%1 is already in the workspace.")
-                    .arg(info.fileName()));
-            return true;  // Readable, and M3 treats a duplicate as a no-op.
+            show_message(tr("%1 is already in the workspace.").arg(info.fileName()));
+            return true;
         }
     }
 
     QFile file(path);
-
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        status_label_->setText(
-            tr("Could not open %1: %2")
-                .arg(info.fileName(), file.errorString()));
+        show_message(tr("Could not open %1: %2")
+                         .arg(info.fileName(), file.errorString()));
         return false;
     }
 
-    QString text = QString::fromUtf8(file.readAll());
-
-    workspace_.add_document(
-        Document(id, info.fileName().toStdString(),
-                 text.toStdString()));
-
+    const auto text = QString::fromUtf8(file.readAll());
+    workspace_.add_document(Document(id, info.fileName().toStdString(),
+                                     text.toStdString()));
     workspace_widget_->add_document(info.fileName());
-
-    invalidate_corpus();
-
-    status_label_->setText(tr("Added %1.").arg(info.fileName()));
-    update_action_states();
+    change_state(state_->workspace_changed(*this));
+    show_message(tr("Added %1.").arg(info.fileName()));
     return true;
 }
 
@@ -171,7 +159,15 @@ void MainWindow::set_core_factory(CoreFactory factory) {
 }
 
 bool MainWindow::build_in_progress() const noexcept {
-    return build_future_.valid();
+    return state_->build_running();
+}
+
+std::thread::id MainWindow::last_build_thread() const noexcept {
+    return last_build_thread_;
+}
+
+QString MainWindow::corpus_state_name() const {
+    return state_->name();
 }
 
 bool MainWindow::start_ipc_server(const QString& socket_path, QString* error) {
@@ -211,109 +207,64 @@ void MainWindow::add_document() {
 }
 
 void MainWindow::build_corpus() {
-    if (workspace_.documents().empty() ||
-        state_ == CorpusState::Building) {
+    if (workspace_.documents().empty()) {
+        return;  // Nothing to build; the button is disabled anyway.
+    }
+    change_state(state_->build_requested(*this));
+}
+
+void MainWindow::collect_finished_build() {
+    auto result = worker_->take_finished();
+    if (!result) {
         return;
     }
 
-    clear_processing_outputs();
-    state_ = CorpusState::Building;
-    workspace_widget_->set_corpus_status(tr("Corpus: Building..."));
-    status_label_->setText(tr("Building corpus..."));
-
-    if (build_future_.valid()) {
-        // A cancelled build is still finishing. Only one worker at a time:
-        // poll_build() starts this build as soon as that one is collected.
-        rebuild_requested_ = true;
+    last_build_thread_ = result->built_on;
+    if (result->succeeded) {
+        change_state(state_->build_succeeded(*this, result->id, result->core));
     } else {
-        start_build_job();
+        change_state(state_->build_failed(
+            *this, result->id, QString::fromStdString(result->error)));
     }
-
-    update_action_states();
 }
 
-void MainWindow::start_build_job() {
-    build_generation_ = generation_;
-    build_cancel_ = std::make_shared<std::atomic<bool>>(false);
-
-    // Workspace is passed by value: the worker gets its own copy.
-    build_future_ = std::async(std::launch::async, run_corpus_build,
-                               workspace_, build_delay_ms_,
-                               build_cancel_, core_factory_);
-    poll_timer_->start();
-}
-
-void MainWindow::poll_build() {
-    if (build_future_.wait_for(std::chrono::seconds(0)) !=
-        std::future_status::ready) {
-        return;
-    }
-
-    poll_timer_->stop();
-    const bool current = build_is_current();
-
-    try {
-        BuildResult result = build_future_.get();
-        if (current) {
-            accept_build(std::move(result.core));
-        }
-    } catch (const std::exception& error) {
-        if (current) {
-            report_build_failure(QString::fromStdString(error.what()));
-        }
-    } catch (...) {
-        if (current) {
-            report_build_failure(tr("unknown error"));
-        }
-    }
-
-    if (rebuild_requested_) {
-        rebuild_requested_ = false;
-        start_build_job();
+void MainWindow::change_state(std::unique_ptr<CorpusState> next) {
+    if (next) {
+        state_ = std::move(next);
+        state_->enter(*this);
     }
     update_action_states();
 }
 
-bool MainWindow::build_is_current() const noexcept {
-#ifdef AIWS_FAULT_ACCEPT_STALE
-    return true;
-#else
-    return build_generation_ == generation_;
-#endif
+// ---- CorpusContext -------------------------------------------------------
+
+std::uint64_t MainWindow::start_build() {
+    const auto id = ++last_build_id_;
+    worker_->submit(BuildRequest{id, workspace_, build_delay_ms_, core_factory_});
+    return id;
 }
 
-void MainWindow::accept_build(ProcessingCore core) {
+void MainWindow::cancel_build() {
+    worker_->cancel();
+}
+
+void MainWindow::install_corpus(ProcessingCore core) {
     processing_core_ = std::move(core);
-    state_ = CorpusState::Current;
-
-    workspace_widget_->set_corpus_status(
-        tr("Corpus: %1 chunks")
-            .arg(static_cast<qulonglong>(
-                processing_core_.chunk_count())));
-
     status_label_->setText(
         tr("Corpus built from %1 document(s).")
-            .arg(static_cast<qulonglong>(
-                workspace_.documents().size())));
+            .arg(static_cast<qulonglong>(workspace_.documents().size())));
 }
 
-void MainWindow::report_build_failure(const QString& reason) {
-#ifdef AIWS_FAULT_LOSE_FAILURE
-    (void)reason;
-    return;
-#else
-    state_ = CorpusState::Failed;
-    workspace_widget_->set_corpus_status(tr("Corpus: Build failed"));
-    status_label_->setText(tr("Build Corpus failed: %1").arg(reason));
-#endif
+std::size_t MainWindow::corpus_chunk_count() const {
+    return processing_core_.chunk_count();
 }
 
-void MainWindow::cancel_running_build() {
-#ifndef AIWS_FAULT_ACCEPT_STALE
-    if (build_cancel_) {
-        build_cancel_->store(true);
-    }
-#endif
+void MainWindow::show_corpus_status(const QString& text) {
+    workspace_widget_->set_corpus_status(text);
+}
+
+void MainWindow::show_message(const QString& text) {
+    status_label_->setText(text);
 }
 
 void MainWindow::document_selected(int row) {
@@ -454,27 +405,16 @@ void MainWindow::term_inspection_requested(
 }
 
 void MainWindow::reset_application() {
-    ++generation_;
-    cancel_running_build();
-    rebuild_requested_ = false;
-
     workspace_.clear();
     processing_core_ = ProcessingCore{};
-    state_ = CorpusState::NotBuilt;
 
-    Resettable* widgets[] = {
-        workspace_widget_,
-        search_widget_,
-        term_inspector_widget_,
-        context_widget_
-    };
+    workspace_widget_->reset();
+    search_widget_->reset();
+    term_inspector_widget_->reset();
+    context_widget_->reset();
 
-    for (Resettable* widget : widgets) {
-        widget->reset();
-    }
-
+    change_state(state_->reset(*this));
     status_label_->setText(tr("Application reset."));
-    update_action_states();
 }
 
 void MainWindow::exit_application() {
@@ -484,7 +424,7 @@ void MainWindow::exit_application() {
 }
 
 bool MainWindow::corpus_is_current() const noexcept {
-    return state_ == CorpusState::Current;
+    return state_->corpus_is_current();
 }
 
 void MainWindow::update_action_states() {
@@ -493,24 +433,10 @@ void MainWindow::update_action_states() {
     bool current = corpus_is_current();
 
     workspace_widget_->set_build_corpus_enabled(
-        has_documents && state_ != CorpusState::Building);
+        has_documents && state_->accepts_build_request());
     search_widget_->set_search_enabled(current && has_query);
     term_inspector_widget_->set_inspection_enabled(current);
     context_widget_->set_build_context_enabled(current && has_query);
-}
-
-void MainWindow::invalidate_corpus() {
-    ++generation_;
-    cancel_running_build();
-    rebuild_requested_ = false;
-
-    if (state_ != CorpusState::NotBuilt) {
-        workspace_widget_->set_corpus_status(
-            tr("Corpus: Out of date (Build Corpus required)"));
-    }
-
-    state_ = CorpusState::NotBuilt;
-    clear_processing_outputs();
 }
 
 void MainWindow::clear_processing_outputs() {

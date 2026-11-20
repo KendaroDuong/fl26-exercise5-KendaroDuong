@@ -9,6 +9,7 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QProcess>
+#include <QSet>
 #include <QPushButton>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -19,8 +20,10 @@
 
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using aiws::gui::MainWindow;
 
@@ -102,6 +105,17 @@ class StudentTests final : public QObject {
     Q_OBJECT
 
 private slots:
+    // M5. The process test runs first: it fails fast, where an in-process
+    // hang could only end at the CTest timeout.
+    void idle_application_exits_promptly();
+    void every_build_runs_on_one_worker_thread();
+    void reset_during_long_build_does_not_delay_next_build();
+    void add_during_long_build_does_not_delay_next_build();
+    void exiting_during_long_build_is_prompt();
+    void failed_build_then_add_is_out_of_date();
+    void build_is_ignored_while_building();
+
+    // M4 and CR-1, rerun.
     void build_runs_in_background_and_becomes_current();
     void gui_stays_usable_during_a_build();
     void add_during_build_discards_stale_result();
@@ -121,6 +135,147 @@ private slots:
     void request_split_into_pieces_is_received();
     void socket_removed_within_500ms_of_exit();
 };
+
+// ---- M5 -------------------------------------------------------------------
+
+// R4: Exit with no build running. Runs the real application and ends it with
+// SIGTERM, the same quit path as the Exit button.
+void StudentTests::idle_application_exits_promptly() {
+    QTemporaryDir dir;
+    const QString socket = dir.filePath("s.sock");
+    QProcess app;
+    app.start(AIWS_APP_PATH, {"--ipc-socket", socket});
+    QVERIFY(app.waitForStarted(kWaitMs));
+    QTRY_VERIFY_WITH_TIMEOUT(QFile::exists(socket), kWaitMs);  // Fully up.
+
+    QElapsedTimer timer;
+    timer.start();
+    app.terminate();
+    const bool exited = app.waitForFinished(3000);
+    if (!exited) {
+        app.kill();
+        app.waitForFinished(kWaitMs);
+    }
+    QVERIFY2(exited, "the application did not exit within 3 s of SIGTERM");
+    QVERIFY(timer.elapsed() < 1000);
+}
+
+// R1: builds for different workspaces all run on the same thread, which is
+// not the GUI thread.
+void StudentTests::every_build_runs_on_one_worker_thread() {
+    QTemporaryDir dir;
+    MainWindow window;
+    QSet<QString> threads;
+
+    for (int i = 0; i < 5; ++i) {
+        QVERIFY(window.add_document_file(write_file(dir, QString("d%1.txt").arg(i))));
+        button(window, "Build Corpus")->click();
+        QTRY_VERIFY_WITH_TIMEOUT(shows_chunks(window), kWaitMs);
+
+        QVERIFY(window.last_build_thread() != std::thread::id());
+        QVERIFY(window.last_build_thread() != std::this_thread::get_id());
+        std::ostringstream id;
+        id << window.last_build_thread();
+        threads.insert(QString::fromStdString(id.str()));
+    }
+    QCOMPARE(threads.size(), 1);
+}
+
+// R3: Reset makes a long build useless. The next build must not wait for it.
+void StudentTests::reset_during_long_build_does_not_delay_next_build() {
+    QTemporaryDir dir;
+    MainWindow window;
+    for (const char* name : {"a.txt", "b.txt", "c.txt"}) {
+        QVERIFY(window.add_document_file(write_file(dir, name)));
+    }
+    window.set_build_delay_ms(3000);  // A 9 s build.
+    button(window, "Build Corpus")->click();
+    QTest::qWait(100);                // Let the worker start it.
+
+    button(window, "Reset")->click();
+    QCOMPARE(corpus_status(window), QString("Corpus: Not built"));
+
+    window.set_build_delay_ms(0);
+    QVERIFY(window.add_document_file(write_file(dir, "d.txt")));
+    QElapsedTimer timer;
+    timer.start();
+    button(window, "Build Corpus")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(shows_chunks(window), 2000);
+    QVERIFY(timer.elapsed() < 2000);
+}
+
+// R3, and decision 2: a workspace change (here add_document_file) cancels.
+void StudentTests::add_during_long_build_does_not_delay_next_build() {
+    QTemporaryDir dir;
+    MainWindow window;
+    for (const char* name : {"a.txt", "b.txt", "c.txt"}) {
+        QVERIFY(window.add_document_file(write_file(dir, name)));
+    }
+    window.set_build_delay_ms(3000);
+    button(window, "Build Corpus")->click();
+    QTest::qWait(100);
+
+    QVERIFY(window.add_document_file(write_file(dir, "d.txt")));
+    QCOMPARE(window.corpus_state_name(), QString("OutOfDate"));
+    QVERIFY(!window.build_in_progress());
+    QVERIFY(button(window, "Build Corpus")->isEnabled());
+
+    window.set_build_delay_ms(0);
+    button(window, "Build Corpus")->click();
+    QTRY_VERIFY_WITH_TIMEOUT(shows_chunks(window), 2000);
+}
+
+// R4 during a build: the worker wakes from its delay and is joined at once.
+void StudentTests::exiting_during_long_build_is_prompt() {
+    QTemporaryDir dir;
+    QElapsedTimer timer;
+    {
+        MainWindow window;
+        QVERIFY(window.add_document_file(write_file(dir, "a.txt")));
+        window.set_build_delay_ms(60000);
+        button(window, "Build Corpus")->click();
+        QTest::qWait(100);
+        timer.start();
+    }
+    QVERIFY(timer.elapsed() < 1000);
+}
+
+// States: Failed --workspace change--> OutOfDate --build--> Building --> Current.
+void StudentTests::failed_build_then_add_is_out_of_date() {
+    QTemporaryDir dir;
+    MainWindow window;
+    QVERIFY(window.add_document_file(write_file(dir, "a.txt")));
+    window.set_core_factory(make_failing_core);
+    button(window, "Build Corpus")->click();
+    QTRY_COMPARE_WITH_TIMEOUT(window.corpus_state_name(), QString("Failed"), kWaitMs);
+
+    QVERIFY(window.add_document_file(write_file(dir, "b.txt")));
+    QCOMPARE(window.corpus_state_name(), QString("OutOfDate"));
+    QCOMPARE(corpus_status(window),
+             QString("Corpus: Out of date (Build Corpus required)"));
+
+    window.set_core_factory(nullptr);
+    button(window, "Build Corpus")->click();
+    QCOMPARE(window.corpus_state_name(), QString("Building"));
+    QTRY_COMPARE_WITH_TIMEOUT(window.corpus_state_name(), QString("Current"), kWaitMs);
+}
+
+// Decision 1: Build Corpus is disabled while building, and the Building state
+// ignores a request that arrives anyway.
+void StudentTests::build_is_ignored_while_building() {
+    QTemporaryDir dir;
+    MainWindow window;
+    QVERIFY(window.add_document_file(write_file(dir, "a.txt")));
+    window.set_build_delay_ms(200);
+    button(window, "Build Corpus")->click();
+    QVERIFY(!button(window, "Build Corpus")->isEnabled());
+
+    QMetaObject::invokeMethod(&window, "build_corpus");  // As if clicked anyway.
+    QCOMPARE(window.corpus_state_name(), QString("Building"));
+    QTRY_VERIFY_WITH_TIMEOUT(shows_chunks(window), kWaitMs);
+}
+
+// ---- M4 and CR-1 ---------------------------------------------------------
 
 void StudentTests::build_runs_in_background_and_becomes_current() {
     QTemporaryDir dir;

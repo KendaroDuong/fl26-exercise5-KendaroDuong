@@ -6,30 +6,43 @@
 #include <QCommandLineParser>
 #include <QMessageBox>
 #include <QObject>
+#include <QSocketNotifier>
 #include <QString>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <csignal>
 #include <iostream>
 
 namespace {
 
-volatile std::sig_atomic_t termination_requested = 0;
+// Self-pipe: the signal handler writes one byte (async-signal-safe), and a
+// QSocketNotifier wakes the event loop on it. Nothing polls a flag.
+int signal_pipe[2] = {-1, -1};
 
 void request_termination(int) {
-    termination_requested = 1;
+    const char byte = 1;
+    ssize_t written = ::write(signal_pipe[1], &byte, 1);
+    (void)written;
 }
 
-// SIGTERM/SIGINT quit through the normal path, so the socket file is removed.
+// SIGTERM/SIGINT quit through the normal path, so the worker is joined and
+// the socket file is removed.
 class TerminationWatcher final : public QObject {
 public:
-    TerminationWatcher() { startTimer(100); }
-
-protected:
-    void timerEvent(QTimerEvent*) override {
-        if (termination_requested != 0) {
-            QApplication::quit();
-        }
+    explicit TerminationWatcher(int fd) : notifier_(fd, QSocketNotifier::Read) {
+        connect(&notifier_, &QSocketNotifier::activated,
+                this, &TerminationWatcher::quit_application);
     }
+
+private:
+    void quit_application() {
+        notifier_.setEnabled(false);
+        QApplication::quit();
+    }
+
+    QSocketNotifier notifier_;
 };
 
 void confirm_exit(QWidget* parent) {
@@ -68,9 +81,13 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    if (::pipe2(signal_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        std::cerr << "cannot create the signal pipe\n";
+        return 1;
+    }
+    TerminationWatcher watcher(signal_pipe[0]);
     std::signal(SIGTERM, request_termination);
     std::signal(SIGINT, request_termination);
-    TerminationWatcher watcher;
 
     aiws::gui::MainWindow window;
     window.set_exit_callback(confirm_exit);

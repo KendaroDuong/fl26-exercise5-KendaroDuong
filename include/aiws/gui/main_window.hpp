@@ -2,20 +2,20 @@
 
 #include <QMainWindow>
 
-#include "aiws/corpus_build_job.hpp"
+#include "aiws/build_worker.hpp"
+#include "aiws/gui/corpus_state.hpp"
 #include "aiws/ipc_server.hpp"
 #include "aiws/processing_core.hpp"
 #include "aiws/workspace.hpp"
 
-#include <atomic>
 #include <cstdint>
-#include <future>
 #include <memory>
+#include <thread>
 
 class QLabel;
 class QPushButton;
+class QSocketNotifier;
 class QString;
-class QTimer;
 class QWidget;
 
 namespace aiws::gui {
@@ -32,7 +32,7 @@ class WorkspaceWidget;
  * major GUI components, and coordinates application-wide state changes and
  * backend operations in response to component events.
  */
-class MainWindow final : public QMainWindow {
+class MainWindow final : public QMainWindow, private CorpusContext {
     Q_OBJECT
 
 public:
@@ -52,7 +52,7 @@ public:
      */
     explicit MainWindow(QWidget* parent = nullptr);
 
-    /** @brief Stops the IPC server, then cancels and waits for any running build. */
+    /** @brief Stops the IPC server, then stops and joins the build worker. */
     ~MainWindow() override;
 
     /**
@@ -79,8 +79,14 @@ public:
     /** @brief Replaces how builds make their ProcessingCore. Lets tests force a failure. */
     void set_core_factory(CoreFactory factory);
 
-    /** @brief True while a worker, even a cancelled one, has not been collected. */
+    /** @brief True while a build for the present workspace is pending or running. */
     bool build_in_progress() const noexcept;
+
+    /** @brief The thread that ran the last build that finished (for tests of R1). */
+    std::thread::id last_build_thread() const noexcept;
+
+    /** @brief Name of the current corpus state, for display and tests only. */
+    QString corpus_state_name() const;
 
     /**
      * @brief Starts serving Remote Add requests on socket_path.
@@ -146,31 +152,15 @@ private slots:
      */
     void exit_application();
 
-    /** @brief Checks whether the worker finished, and collects its result if so. */
-    void poll_build();
-
     /** @brief GUI-thread end of a Remote Add request, reached by a queued call. */
     void remote_add_document(const QString& path);
 
+    /** @brief Runs when the worker signals a finished build; feeds it to the state. */
+    void collect_finished_build();
+
 private:
-    enum class CorpusState { NotBuilt, Building, Current, Failed };
-
-    static constexpr int kPollIntervalMs = 50;
-
-    /** @brief Starts the worker on a copy of the workspace. */
-    void start_build_job();
-
-    /** @brief True if the build being collected reflects the present workspace. */
-    bool build_is_current() const noexcept;
-
-    /** @brief Makes a finished, valid build the current corpus. */
-    void accept_build(ProcessingCore core);
-
-    /** @brief Shows a build failure to the user and leaves the building state. */
-    void report_build_failure(const QString& reason);
-
-    /** @brief Asks the running worker, if any, to stop early. */
-    void cancel_running_build();
+    /** @brief Makes next the current state, unless a handler returned nullptr. */
+    void change_state(std::unique_ptr<CorpusState> next);
 
     /** @brief True only when the corpus reflects the present workspace. */
     bool corpus_is_current() const noexcept;
@@ -180,29 +170,24 @@ private:
      */
     void update_action_states();
 
-    /**
-     * @brief Marks the processing corpus as no longer current for the workspace.
-     *
-     * Processing output that depends on the previous corpus is no longer made
-     * available after invalidation.
-     */
-    void invalidate_corpus();
-
-    /**
-     * @brief Clears displayed search and context output that depends on processing state.
-     */
-    void clear_processing_outputs();
+    // ---- CorpusContext: what the states may ask for ------------------
+    std::uint64_t start_build() override;
+    void cancel_build() override;
+    void install_corpus(ProcessingCore core) override;
+    std::size_t corpus_chunk_count() const override;
+    void show_corpus_status(const QString& text) override;
+    void show_message(const QString& text) override;
+    void clear_processing_outputs() override;
 
     Workspace workspace_;
     ProcessingCore processing_core_;
-    CorpusState state_{CorpusState::NotBuilt};
-    std::uint64_t generation_{0};        // Bumped by every workspace change.
-    std::uint64_t build_generation_{0};  // generation_ when the worker started.
+    std::unique_ptr<CorpusState> state_;  // Never null after construction.
+    std::uint64_t last_build_id_{0};      // GUI thread only.
+    std::thread::id last_build_thread_;   // GUI thread only.
     int build_delay_ms_{0};
-    bool rebuild_requested_{false};
     CoreFactory core_factory_;
-    std::shared_ptr<std::atomic<bool>> build_cancel_;
-    std::future<BuildResult> build_future_;
+    std::unique_ptr<BuildWorker> worker_;
+    std::unique_ptr<QSocketNotifier> build_done_notifier_;  // Destroyed before worker_.
     std::unique_ptr<IpcServer> ipc_server_;
     ExitCallback exit_callback_{nullptr};
 
@@ -213,7 +198,6 @@ private:
     QLabel* status_label_{nullptr};
     QPushButton* reset_button_{nullptr};
     QPushButton* exit_button_{nullptr};
-    QTimer* poll_timer_{nullptr};
 };
 
 }  // namespace aiws::gui
