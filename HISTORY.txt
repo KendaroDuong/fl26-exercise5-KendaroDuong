@@ -1,4 +1,54 @@
-commit 51bc3a55e1d58fb255046bfbe9f945e1462b7d5e (HEAD -> main)
+commit a76a51335643c13af4313151f217f00b9da33611 (HEAD -> main)
+Author: KendaroDuong <kendaro@vt.edu>
+Date:   2026-11-20 18:01:07 -0500
+
+    M5: build worker, State pattern, wake-pipe shutdown, tests, DESIGN.md
+
+ CMakeLists.txt                    |  24 ++--
+ DESIGN.md                         | 108 +++++++++++-------
+ VIDEO.md                          |   3 +
+ include/aiws/build_worker.hpp     |  81 ++++++++++++++
+ include/aiws/corpus_build_job.hpp |  33 ------
+ include/aiws/gui/corpus_state.hpp | 120 ++++++++++++++++++++
+ include/aiws/gui/main_window.hpp  |  78 +++++--------
+ include/aiws/ipc_server.hpp       |   8 +-
+ src/build_worker.cpp              | 147 ++++++++++++++++++++++++
+ src/corpus_build_job.cpp          |  45 --------
+ src/corpus_state.cpp              |  93 +++++++++++++++
+ src/ipc_server.cpp                | 123 +++++++++++++-------
+ src/main.cpp                      |  37 ++++--
+ src/main_window.cpp               | 230 +++++++++++++-------------------------
+ tests/student_tests.cpp           | 155 +++++++++++++++++++++++++
+ 15 files changed, 900 insertions(+), 385 deletions(-)
+
+commit 4d59dc469b632a471a34e062fabf8fd79f5531cc (origin/main)
+Author: KendaroDuong <kendaro@vt.edu>
+Date:   2026-11-04 22:12:18 -0500
+
+    Complete DESIGN.md final
+
+ DESIGN.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+commit edf601fcb486e8afe90922fdee98791949769b0e
+Author: KendaroDuong <kendaro@vt.edu>
+Date:   2026-11-04 22:05:10 -0500
+
+    Complete DESIGN.md and pair log
+
+ DESIGN.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+commit fc27b3da3e13d5839708f8cb0f177433f075e706
+Author: KendaroDuong <kendaro@vt.edu>
+Date:   2026-11-04 21:49:47 -0500
+
+    Regenerate HISTORY.txt
+
+ HISTORY.txt | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+commit 51bc3a55e1d58fb255046bfbe9f945e1462b7d5e
 Author: KendaroDuong <kendaro@vt.edu>
 Date:   2026-11-04 21:49:28 -0500
 
@@ -7,7 +57,7 @@ Date:   2026-11-04 21:49:28 -0500
  DESIGN.md | 12 ++++++------
  1 file changed, 6 insertions(+), 6 deletions(-)
 
-commit 684a94ab0c9e4cee0fdc70167730603a3920809e (origin/main)
+commit 684a94ab0c9e4cee0fdc70167730603a3920809e
 Author: KendaroDuong <kendaro@vt.edu>
 Date:   2026-11-04 21:43:51 -0500
 
